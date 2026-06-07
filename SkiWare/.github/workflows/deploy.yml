@@ -1,0 +1,159 @@
+name: Build & Deploy to Cloud Run
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 'Which service to deploy'
+        required: true
+        default: 'both'
+        type: choice
+        options:
+          - both
+          - web
+          - data-agent
+
+env:
+  PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+  REGION: us-central1
+  SERVICE_NAME: skiware
+  JOB_NAME: skiware-data-agent
+  REPO_NAME: cloud-run-apps
+
+jobs:
+  deploy:
+    if: github.event_name == 'push' || inputs.target == 'web' || inputs.target == 'both'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write  # required for Workload Identity Federation
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
+          service_account: ${{ secrets.WIF_SERVICE_ACCOUNT }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure Docker for Artifact Registry
+        run: gcloud auth configure-docker ${{ env.REGION }}-docker.pkg.dev --quiet
+
+      - name: Build and Push Container
+        run: |
+          IMAGE="${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPO_NAME }}/${{ env.SERVICE_NAME }}:${GITHUB_SHA::7}"
+          docker build -t "$IMAGE" .
+          docker push "$IMAGE"
+          echo "IMAGE=$IMAGE" >> $GITHUB_ENV
+
+      - name: Deploy to Cloud Run
+        run: |
+          gcloud run deploy ${{ env.SERVICE_NAME }} \
+            --image "$IMAGE" \
+            --region ${{ env.REGION }} \
+            --platform managed \
+            --allow-unauthenticated \
+            --port 8080 \
+            --memory 512Mi \
+            --cpu 1 \
+            --min-instances 0 \
+            --max-instances 3 \
+            --service-account ${{ secrets.CLOUD_RUN_SA }} \
+            --set-env-vars "CLOUD_SQL_INSTANCE=${{ secrets.CLOUD_SQL_INSTANCE }}" \
+            --set-env-vars "DB_USER=${{ secrets.DB_USER }}" \
+            --set-env-vars "DB_PASS=${{ secrets.DB_PASS }}" \
+            --set-env-vars "DB_NAME=${{ secrets.DB_NAME }}" \
+            --set-env-vars "GOOGLE_PLACES_API_KEY=${{ secrets.GOOGLE_PLACES_API_KEY }}" \
+            --set-env-vars "GEMINI_API_KEY=${{ secrets.GEMINI_API_KEY }}" \
+            --set-env-vars "GCP_PROJECT=${{ secrets.GCP_PROJECT_ID }}" \
+            --set-env-vars "GCP_REGION=${{ env.REGION }}" \
+            --quiet
+
+  deploy-data-agent:
+    if: github.event_name == 'push' || inputs.target == 'data-agent' || inputs.target == 'both'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
+          service_account: ${{ secrets.WIF_SERVICE_ACCOUNT }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure Docker for Artifact Registry
+        run: gcloud auth configure-docker ${{ env.REGION }}-docker.pkg.dev --quiet
+
+      - name: Build and Push Data Agent Container
+        run: |
+          JOB_IMAGE="${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPO_NAME }}/${{ env.JOB_NAME }}:${GITHUB_SHA::7}"
+          docker build -f Dockerfile.data_agent -t "$JOB_IMAGE" .
+          docker push "$JOB_IMAGE"
+          echo "JOB_IMAGE=$JOB_IMAGE" >> $GITHUB_ENV
+
+      - name: Deploy Cloud Run Job
+        run: |
+          ENV_VARS="CLOUD_SQL_INSTANCE=${{ secrets.CLOUD_SQL_INSTANCE }}"
+          ENV_VARS="$ENV_VARS,DB_USER=${{ secrets.DB_USER }}"
+          ENV_VARS="$ENV_VARS,DB_PASSWORD=${{ secrets.DB_PASS }}"
+          ENV_VARS="$ENV_VARS,DB_NAME=${{ secrets.DB_NAME }}"
+          ENV_VARS="$ENV_VARS,GCP_PROJECT=${{ secrets.GCP_PROJECT_ID }}"
+          ENV_VARS="$ENV_VARS,GCP_REGION=${{ env.REGION }}"
+          ENV_VARS="$ENV_VARS,YOUTUBE_API_KEY=${{ secrets.YOUTUBE_API_KEY }}"
+          ENV_VARS="$ENV_VARS,REDDIT_CLIENT_ID=${{ secrets.REDDIT_CLIENT_ID }}"
+          ENV_VARS="$ENV_VARS,REDDIT_CLIENT_SECRET=${{ secrets.REDDIT_CLIENT_SECRET }}"
+
+          # Create on first deploy, update on subsequent deploys
+          gcloud run jobs create ${{ env.JOB_NAME }} \
+            --image "$JOB_IMAGE" \
+            --region ${{ env.REGION }} \
+            --service-account ${{ secrets.CLOUD_RUN_SA }} \
+            --set-env-vars "$ENV_VARS" \
+            --memory 1Gi \
+            --cpu 1 \
+            --max-retries 2 \
+            --task-timeout 3600 \
+            --quiet 2>/dev/null || \
+          gcloud run jobs update ${{ env.JOB_NAME }} \
+            --image "$JOB_IMAGE" \
+            --region ${{ env.REGION }} \
+            --set-env-vars "$ENV_VARS" \
+            --quiet
+
+      - name: Create or Update Cloud Scheduler (weekly Monday 6am MT)
+        run: |
+          JOB_URI="https://run.googleapis.com/v2/projects/${{ env.PROJECT_ID }}/locations/${{ env.REGION }}/jobs/${{ env.JOB_NAME }}:run"
+          SA="${{ secrets.CLOUD_RUN_SA }}"
+
+          gcloud scheduler jobs create http ${{ env.JOB_NAME }}-weekly \
+            --location ${{ env.REGION }} \
+            --schedule "0 13 * * 1" \
+            --uri "$JOB_URI" \
+            --message-body "{}" \
+            --oauth-service-account-email "$SA" \
+            --time-zone "UTC" \
+            --quiet 2>/dev/null || \
+          gcloud scheduler jobs update http ${{ env.JOB_NAME }}-weekly \
+            --location ${{ env.REGION }} \
+            --schedule "0 13 * * 1" \
+            --uri "$JOB_URI" \
+            --message-body "{}" \
+            --oauth-service-account-email "$SA" \
+            --time-zone "UTC" \
+            --quiet

@@ -1,0 +1,10 @@
+FROM python:3.12-slim
+WORKDIR /app
+
+COPY data_agent/requirements.txt ./data_agent/requirements.txt
+RUN pip install --no-cache-dir -r data_agent/requirements.txt
+
+COPY data_agent/ ./data_agent/
+COPY backend/ ./backend/
+
+CMD ["python", "-m", "data_agent"]
